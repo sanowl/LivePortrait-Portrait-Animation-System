@@ -15,6 +15,16 @@ LEARNING_RATE = 2e-4
 STAGE_1_EPOCHS = 80
 STAGE_2_EPOCHS = 20
 
+# Check for MPS availability
+if torch.backends.mps.is_available():
+    device = torch.device("mps")
+    print("Using MPS device")
+    device = torch.device("cuda")
+    print("Using CUDA device")
+else:
+    device = torch.device("cpu")
+    print("Using CPU device")
+
 class CelebADataset(Dataset):
     def __init__(self, split="train", transform=None):
         self.dataset = load_dataset("huggan/celeba-faces", split=split)
@@ -339,7 +349,6 @@ def train(generator, discriminator, dataloader, optimizer_G, optimizer_D, device
     return running_loss_G / len(dataloader), running_loss_D / len(dataloader)
 
 def main():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
     transform = transforms.Compose([
