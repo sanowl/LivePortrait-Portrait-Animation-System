@@ -1,0 +1,4 @@
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
+typeCheckingMode = "off" # uncomment this if you don't want type checking
