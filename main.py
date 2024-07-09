@@ -19,6 +19,7 @@ STAGE_2_EPOCHS = 20
 if torch.backends.mps.is_available():
     device = torch.device("mps")
     print("Using MPS device")
+elif torch.cuda.is_available():
     device = torch.device("cuda")
     print("Using CUDA device")
 else:
@@ -257,8 +258,9 @@ def calculate_stitching_loss(output, source):
 
 def create_stitching_mask(shape):
     mask = torch.ones(shape)
-    mask[:, :, :shape[2]//3, :] = 0  # Assume top 1/3 is face
+    mask[:, :, :shape[2]//3, :] = 0 
     return mask
+
 
 def calculate_eye_retargeting_loss(output, c_s_eyes, c_d_eyes):
     eye_region = extract_eye_region(output)
