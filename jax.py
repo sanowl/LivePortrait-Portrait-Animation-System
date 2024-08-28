@@ -13,12 +13,16 @@ import cv2
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 import face_alignment
+import pickle
+from typing import Dict, Any
+from functools import partial
 
 # Constants
 IMAGE_SIZE, BATCH_SIZE, LEARNING_RATE = 256, 32, 2e-4
 STAGE_1_EPOCHS, STAGE_2_EPOCHS = 80, 20
 
-device = jax.devices()[0]
+# Check for GPU availability
+device = jax.devices("gpu")[0] if jax.devices("gpu") else jax.devices("cpu")[0]
 print(f"Using {device} device")
 
 class CelebADataset:
@@ -115,7 +119,7 @@ class AttentionModule(nn.Module):
         key = key.reshape((b, h * w, c // 8)).transpose((0, 2, 1))
         value = value.reshape((b, h * w, c))
 
-        attention = jnp.matmul(query, key)
+        attention = jnp.matmul(query, key) / jnp.sqrt(c // 8)
         attention = nn.softmax(attention, axis=-1)
 
         out = jnp.matmul(attention, value)
@@ -195,9 +199,8 @@ def perceptual_loss(vgg, output, target):
     target_features = vgg(target)
     return sum(jnp.mean(jnp.abs(of - tf)) for of, tf in zip(output_features, target_features))
 
-def adversarial_loss(output, discriminator):
-    fake_pred = discriminator(output)
-    return -jnp.mean(jnp.log(fake_pred + 1e-8))
+def adversarial_loss(discriminator_output):
+    return -jnp.mean(jnp.log(discriminator_output + 1e-8))
 
 def stitching_loss(output, source):
     mask = create_stitching_mask(source.shape)
@@ -234,13 +237,18 @@ def extract_lip_landmarks(landmarks):
 def extract_lip_region(image):
     return image[:, :, 2*image.shape[2]//3:, image.shape[3]//4:3*image.shape[3]//4]
 
-@jit
-def train_step(state, batch, rng):
+class TrainState(train_state.TrainState):
+    discriminator: Any
+    vgg: Any
+
+@partial(jax.jit, static_argnums=(0,))
+def train_step(apply_fn, state: TrainState, batch, rng):
     def loss_fn(params):
         source_images, driving_images, source_landmarks, driving_landmarks = batch
-        generated_images = state.apply_fn({'params': params}, source_images, driving_images)
+        generated_images = apply_fn({'params': params}, source_images, driving_images)
         
-        loss_adv = adversarial_loss(generated_images, state.discriminator)
+        discriminator_output = state.discriminator(generated_images)
+        loss_adv = adversarial_loss(discriminator_output)
         loss_perceptual = perceptual_loss(state.vgg, generated_images, driving_images)
         loss_stitching = stitching_loss(generated_images, source_images)
         loss_eye = eye_retargeting_loss(generated_images, source_landmarks, driving_landmarks)
@@ -265,14 +273,32 @@ def train_step(state, batch, rng):
     
     return new_state, metrics, generated_images
 
-def validate(state, val_dataloader):
+@jax.jit
+def validate_step(apply_fn, params, vgg, batch):
+    source_images, driving_images, _, _ = batch
+    generated_images = apply_fn({'params': params}, source_images, driving_images)
+    loss = perceptual_loss(vgg, generated_images, driving_images)
+    return loss
+
+def validate(apply_fn, state: TrainState, val_dataloader):
     val_loss = 0.0
     for batch in val_dataloader:
-        source_images, driving_images, _, _ = batch
-        generated_images = state.apply_fn({'params': state.params}, source_images, driving_images)
-        loss = perceptual_loss(state.vgg, generated_images, driving_images)
-        val_loss += loss.item()
+        val_loss += validate_step(apply_fn, state.params, state.vgg, batch)
     return val_loss / len(val_dataloader)
+
+def create_train_state(rng, generator, discriminator, vgg, learning_rate):
+    generator_params = generator.init(rng, jnp.ones((1, IMAGE_SIZE, IMAGE_SIZE, 3)), jnp.ones((1, IMAGE_SIZE, IMAGE_SIZE, 3)))
+    discriminator_params = discriminator.init(rng, jnp.ones((1, IMAGE_SIZE, IMAGE_SIZE, 3)))
+    vgg_params = vgg.init(rng, jnp.ones((1, IMAGE_SIZE, IMAGE_SIZE, 3)))
+
+    tx = optax.adam(learning_rate, b1=0.5, b2=0.999)
+    return TrainState.create(
+        apply_fn=generator.apply,
+        params=generator_params,
+        tx=tx,
+        discriminator=discriminator.apply({'params': discriminator_params}),
+        vgg=vgg.apply({'params': vgg_params})
+    )
 
 def train(config):
     wandb.init(project="jax-live-portrait-generation", config=config)
@@ -283,7 +309,8 @@ def train(config):
         A.Resize(IMAGE_SIZE, IMAGE_SIZE),
         A.HorizontalFlip(p=0.5),
         A.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-        ToTensorV2 ()])
+        ToTensorV2()
+    ])
 
     dataset = CelebADataset(transform=transform)
     train_dataset, val_dataset = train_test_split(dataset, test_size=0.1, random_state=42)
@@ -295,23 +322,9 @@ def train(config):
     discriminator = Discriminator()
     vgg = VGGPerceptualLoss()
 
-    # Initialize models
     rng, init_rng = random.split(rng)
-    dummy_input = jnp.ones((1, IMAGE_SIZE, IMAGE_SIZE, 3))
-    params = generator.init(init_rng, dummy_input, dummy_input)
+    state = create_train_state(init_rng, generator, discriminator, vgg, LEARNING_RATE)
 
-    # Initialize optimizers
-    tx = optax.adam(learning_rate=LEARNING_RATE, b1=0.5, b2=0.999)
-
-    # Create training state
-    state = train_state.TrainState.create(
-        apply_fn=generator.apply,
-        params=params,
-        tx=tx,
-    )
-    state = state.replace(discriminator=discriminator, vgg=vgg)
-
-    # Training loop
     best_val_loss = float('inf')
 
     print("✨ Starting Stage 1 training...")
@@ -319,11 +332,11 @@ def train(config):
         # Training
         for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{STAGE_1_EPOCHS}"):
             rng, step_rng = random.split(rng)
-            state, metrics, generated_images = train_step(state, batch, step_rng)
+            state, metrics, generated_images = train_step(generator.apply, state, batch, step_rng)
             wandb.log(metrics)
 
         # Validation
-        val_loss = validate(state, val_loader)
+        val_loss = validate(generator.apply, state, val_loader)
         print(f"Epoch [{epoch+1}/{STAGE_1_EPOCHS}], Val Loss: {val_loss:.4f}")
         wandb.log({"val_loss": val_loss, "epoch": epoch})
 
@@ -340,11 +353,11 @@ def train(config):
         # Training
         for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{STAGE_2_EPOCHS}"):
             rng, step_rng = random.split(rng)
-            state, metrics, generated_images = train_step(state, batch, step_rng)
+            state, metrics, generated_images = train_step(generator.apply, state, batch, step_rng)
             wandb.log(metrics)
 
         # Validation
-        val_loss = validate(state, val_loader)
+        val_loss = validate(generator.apply, state, val_loader)
         print(f"Epoch [{epoch+1}/{STAGE_2_EPOCHS}], Val Loss: {val_loss:.4f}")
         wandb.log({"val_loss": val_loss, "epoch": epoch + STAGE_1_EPOCHS})
 
@@ -369,5 +382,6 @@ if __name__ == "__main__":
         'learning_rate': LEARNING_RATE,
         'stage_1_epochs': STAGE_1_EPOCHS,
         'stage_2_epochs': STAGE_2_EPOCHS,
+        'image_size': IMAGE_SIZE,
     }
     train(config)
