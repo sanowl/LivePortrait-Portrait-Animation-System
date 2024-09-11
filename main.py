@@ -50,7 +50,7 @@ class CelebADataset(Dataset):
         for item in tqdm(self.dataset, desc="Extracting landmarks"):
             img = np.array(item['image'])
             detected_landmarks = self.fa.get_landmarks(img)
-            if detected_landmarks is not None:
+            if detected_landmarks is not None and len(detected_landmarks) > 0:
                 landmarks.append(detected_landmarks[0])
             else:
                 landmarks.append(np.zeros((68, 2)))
@@ -172,7 +172,7 @@ class LivePortrait(nn.Module):
     
     @staticmethod
     def get_grid(b, h, w):
-        xx, yy = torch.meshgrid(torch.arange(w), torch.arange(h))
+        yy, xx = torch.meshgrid(torch.arange(h), torch.arange(w), indexing='ij')
         return torch.stack((xx.repeat(b, 1, 1), yy.repeat(b, 1, 1)), 1).float()
 
 class Discriminator(nn.Module):
@@ -242,9 +242,9 @@ def calculate_eye_retargeting_loss(output, source_landmarks, driving_landmarks):
     return F.mse_loss(output_eyes, driving_eyes - source_eyes + output_eyes)
 
 def extract_eye_landmarks(landmarks):
-    left_eye = landmarks[36:42]
-    right_eye = landmarks[42:48]
-    return torch.cat([left_eye, right_eye])
+    left_eye = landmarks[:, 36:42]
+    right_eye = landmarks[:, 42:48]
+    return torch.cat([left_eye, right_eye], dim=1)
 
 def extract_eye_region(image):
     return image[:, :, :image.shape[2]//3, image.shape[3]//4:3*image.shape[3]//4]
@@ -256,10 +256,12 @@ def calculate_lip_retargeting_loss(output, source_landmarks, driving_landmarks):
     return F.mse_loss(output_lips, driving_lips - source_lips + output_lips)
 
 def extract_lip_landmarks(landmarks):
-    return landmarks[48:]
+    return landmarks[:, 48:]
 
 def extract_lip_region(image):
     return image[:, :, 2*image.shape[2]//3:, image.shape[3]//4:3*image.shape[3]//4]
+
+# ... [Previous code remains the same] ...
 
 def train(generator, discriminator, dataloader, optimizer_G, optimizer_D, device, perceptual_loss, stage):
     generator.train()
@@ -274,6 +276,7 @@ def train(generator, discriminator, dataloader, optimizer_G, optimizer_D, device
             source_landmarks, driving_landmarks = source_landmarks.to(device), driving_landmarks.to(device)
             batch_size = source_images.size(0)
             
+            # Generator training
             optimizer_G.zero_grad()
             generated_images = generator(source_images, driving_images)
             
@@ -288,10 +291,15 @@ def train(generator, discriminator, dataloader, optimizer_G, optimizer_D, device
             loss_G.backward()
             optimizer_G.step()
             
+            # Discriminator training
             optimizer_D.zero_grad()
             
             real_pred = discriminator(driving_images)
             fake_pred = discriminator(generated_images.detach())
+            
+            real_loss = F.binary_cross_entropy(real_pred, torch.ones_like(real_pred))
+            fake_loss = F.binary_cross_entropy(fake_pred, torch.zeros_like(fake_pred))
+            loss_D = (real_loss + fake_loss) / 2
             
             loss_D.backward()
             optimizer_D.step()
@@ -336,7 +344,9 @@ def main():
     ])
     
     dataset = CelebADataset(transform=transform)
-    train_dataset, val_dataset = train_test_split(dataset, test_size=0.1, random_state=42)
+    train_indices, val_indices = train_test_split(range(len(dataset)), test_size=0.1, random_state=42)
+    train_dataset = torch.utils.data.Subset(dataset, train_indices)
+    val_dataset = torch.utils.data.Subset(dataset, val_indices)
     
     train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
     val_dataloader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
