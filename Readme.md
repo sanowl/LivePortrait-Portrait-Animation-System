@@ -1,4 +1,4 @@
-# LivePortrait: Advanced Portrait Animation System
+# LivePortrait:  Portrait Animation System
 
 LivePortrait is a deep learning-based system for animating portrait images. It uses a two-stage training process to create realistic and controllable animations from static portrait images, implementing key features like stitching and retargeting.
 
