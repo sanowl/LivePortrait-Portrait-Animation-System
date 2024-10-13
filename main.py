@@ -20,6 +20,7 @@ from sklearn.model_selection import train_test_split
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 import face_alignment
+import secrets
 
 # ===========================
 # Configuration and Setup
@@ -65,9 +66,7 @@ def set_seed(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
-    # For Python random module if used
-    import random
-    random.seed(seed)
+    secrets.SystemRandom().seed(seed)
     torch.backends.cudnn.deterministic = True
 
 # ===========================
