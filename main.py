@@ -20,6 +20,7 @@ from sklearn.model_selection import train_test_split
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 import face_alignment
+import fickling
 
 # ===========================
 # Configuration and Setup
@@ -125,7 +126,7 @@ class CelebADataset(Dataset):
             logging.info(f"Loading cached landmarks from {self.cache_file}...")
             try:
                 with open(self.cache_file, "rb") as f:
-                    landmarks = pickle.load(f)
+                    landmarks = fickling.load(f)
                 if len(landmarks) != len(self.dataset):
                     logging.warning("Cached landmarks size does not match dataset size. Re-extracting.")
                     return self.extract_landmarks()
